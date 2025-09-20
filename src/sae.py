@@ -275,6 +275,8 @@ class BatchTopKSAE(BaseAutoencoder):
             "l0_norm": l0_norm,
             "l1_norm": l1_norm,
             "aux_loss": aux_loss,
+            "positive_features": (acts_topk > 0).float().sum(-1).mean(),
+            "negative_features": (acts_topk < 0).float().sum(-1).mean(),
         }
         return output
 
