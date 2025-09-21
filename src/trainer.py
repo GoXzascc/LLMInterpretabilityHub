@@ -13,7 +13,7 @@ from loguru import logger
 from dotenv import load_dotenv
 from utils import seed_setup
 from data import ActivationsStore
-from sae import TopKSAE, BatchTopKSAE, BaseAutoencoder, BatchAbsoluteKSAE, AbsoluteKSAE
+from sae import BatchTopKSAE, BaseAutoencoder, BatchAbsoluteKSAE, JumpReLUSAE
 from functools import partial
 
 load_dotenv()
@@ -53,7 +53,7 @@ def config() -> argparse.Namespace:
         "--sae_name",
         type=str,
         default="batchabsolutek",
-        choices=["topk", "absolutek", "batchabsolutek", "batchtopk"],
+        choices=["batchabsolutek", "batchtopk", "jumprelu"],
     )
     parser.add_argument("--layer", type=int, default=3)
     parser.add_argument("--torch_dtype", type=str, default="bfloat16")
@@ -197,14 +197,12 @@ def SAETrainer() -> None:
     cfg["dtype"] = torch_dtype
     activations_store = ActivationsStore(model, cfg)
 
-    if args.sae_name == "topk":
-        sae = TopKSAE(cfg)
-    elif args.sae_name == "absolutek":
-        sae = AbsoluteKSAE(cfg)
-    elif args.sae_name == "batchabsolutek":
+    if args.sae_name == "batchabsolutek":
         sae = BatchAbsoluteKSAE(cfg)
     elif args.sae_name == "batchtopk":
         sae = BatchTopKSAE(cfg)
+    elif args.sae_name == "jumprelu":
+        sae = JumpReLUSAE(cfg)
     else:
         raise ValueError(f"Invalid SAE name: {args.sae_name}")
 
@@ -224,7 +222,7 @@ def train_sae(
     model: transformer_lens.HookedTransformer,
     cfg: dict,
 ) -> None:
-    num_batches = cfg["num_tokens"] // cfg["batch_size"]
+    # num_batches = cfg["num_tokens"] // cfg["batch_size"]
     optimizer = torch.optim.Adam(
         sae.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"])
     )

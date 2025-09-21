@@ -1,5 +1,6 @@
-from huggingface_hub import parse_safetensors_file_metadata
 import torch
+import safetensors
+from loguru import logger
 
 
 class BaseAutoencoder(torch.nn.Module):
@@ -30,6 +31,21 @@ class BaseAutoencoder(torch.nn.Module):
         )
 
         self.to(cfg["dtype"]).to(cfg["device"])
+
+    @classmethod
+    def from_pretrained(cls, checkpoint_path):
+        """Load the model from a checkpoint using safetensors
+
+        Args:
+            checkpoint_path: Checkpoint path
+
+        Returns:
+            BaseAutoencoder: BaseAutoencoder model
+        """
+        checkpoint = safetensors.torch.load_file(checkpoint_path)
+        baseautoencoder = cls(checkpoint["cfg"])
+        baseautoencoder.load_state_dict(checkpoint["state_dict"])
+        return baseautoencoder
 
     def preprocess_input(self, x) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Preprocess the input
@@ -302,11 +318,114 @@ class BatchTopKSAE(BaseAutoencoder):
             return torch.tensor(0, dtype=x.dtype, device=x.device)
 
 
-class TopKSAE(BaseAutoencoder):
+class RectangleFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return ((x > -0.5) & (x < 0.5)).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        grad_input[(x <= -0.5) | (x >= 0.5)] = 0
+        return grad_input
+    
+class JumpReLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, log_threshold, bandwidth):
+        ctx.save_for_backward(x, log_threshold, torch.tensor(bandwidth))
+        threshold = torch.exp(log_threshold)
+        return x * (x > threshold).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, log_threshold, bandwidth_tensor = ctx.saved_tensors
+        bandwidth = bandwidth_tensor.item()
+        threshold = torch.exp(log_threshold)
+        x_grad = (x > threshold).float() * grad_output
+        threshold_grad = (
+            -(threshold / bandwidth)
+            * RectangleFunction.apply((x - threshold) / bandwidth)
+            * grad_output
+        )
+        return x_grad, threshold_grad, None  # None for bandwidth
+    
+    
+class JumpReLU(torch.nn.Module):
+    def __init__(self, feature_size, bandwidth, device='cpu'):
+        super(JumpReLU, self).__init__()
+        self.log_threshold = torch.nn.Parameter(torch.zeros(feature_size, device=device))
+        self.bandwidth = bandwidth
+
+    def forward(self, x):
+        return JumpReLUFunction.apply(x, self.log_threshold, self.bandwidth)
+    
+    
+
+class StepFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, log_threshold, bandwidth):
+        ctx.save_for_backward(x, log_threshold, torch.tensor(bandwidth))
+        threshold = torch.exp(log_threshold)
+        return (x > threshold).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, log_threshold, bandwidth_tensor = ctx.saved_tensors
+        bandwidth = bandwidth_tensor.item()
+        threshold = torch.exp(log_threshold)
+        x_grad = torch.zeros_like(x)
+        threshold_grad = (
+            -(1.0 / bandwidth)
+            * RectangleFunction.apply((x - threshold) / bandwidth)
+            * grad_output
+        )
+        return x_grad, threshold_grad, None  # None for bandwidth
+   
+class JumpReLUSAE(BaseAutoencoder):
     def __init__(self, cfg):
         super().__init__(cfg)
+        self.jumprelu = JumpReLU(feature_size=cfg["dict_size"], bandwidth=cfg["bandwidth"], device=cfg["device"])
+        self.dtype = cfg["dtype"]
+        self.device = cfg["device"]
 
+    def forward(self, x, use_pre_enc_bias=False):
+        x, x_mean, x_std = self.preprocess_input(x)
 
-class AbsoluteKSAE(BaseAutoencoder):
-    def __init__(self, cfg):
-        super().__init__(cfg)
+        if use_pre_enc_bias:
+            x = x - self.b_dec
+
+        pre_activations = torch.relu(x @ self.W_enc + self.b_enc)
+        feature_magnitudes = self.jumprelu(pre_activations)
+        feature_magnitudes = feature_magnitudes.to(self.dtype)
+        x_reconstructed = feature_magnitudes @ self.W_dec + self.b_dec
+
+        return self.get_loss_dict(x, x_reconstructed, feature_magnitudes, x_mean, x_std)
+
+    def get_loss_dict(self, x, x_reconstruct, acts, x_mean, x_std):
+        l2_loss = (x_reconstruct.float() - x.float()).pow(2).mean()
+
+        l0 = StepFunction.apply(acts, self.jumprelu.log_threshold, self.cfg["bandwidth"]).sum(dim=-1).mean()
+        l0_loss = self.cfg["l1_coeff"] * l0
+        l1_loss = l0_loss
+
+        loss = l2_loss + l1_loss
+        num_dead_features = (
+            self.num_batches_not_active > self.cfg["n_batches_to_dead"]
+        ).sum()
+
+        sae_out = self.postprocess_output(x_reconstruct, x_mean, x_std)
+        output = {
+            "sae_out": sae_out,
+            "feature_acts": acts,
+            "num_dead_features": num_dead_features,
+            "loss": loss,
+            "l1_loss": l1_loss,
+            "l2_loss": l2_loss,
+            "l0_norm": l0,
+            "l1_norm": l0,
+            "positive_features": (acts > 0).float().sum(-1).mean(),
+            "negative_features": (acts < 0).float().sum(-1).mean(),
+        }
+        return output
